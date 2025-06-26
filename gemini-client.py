@@ -9,8 +9,9 @@ import urllib.parse
 import requests
 import time
 import argparse
+import platform
 from pathlib import Path
-from typing import Union
+from typing import Union, List, Dict, Any
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
@@ -20,7 +21,7 @@ class Models:
     FLASH = "gemini-2.5-flash"
     
     @classmethod
-    def all(cls):
+    def all(cls) -> List[str]:
         """Returns a list of all available generation models."""
         return [cls.DEFAULT, cls.FLASH]
 
@@ -46,6 +47,7 @@ class GeminiClient:
     _AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
     _CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com"
     _API_VERSION = "v1internal"
+    _PLUGIN_VERSION = "1.0.0" # Mock version
 
     def __init__(self, credentials_dir: Path = None):
         if credentials_dir is None:
@@ -61,10 +63,29 @@ class GeminiClient:
         """Starts a new chat session."""
         return ChatSession(self, model)
 
+    def _get_platform(self) -> str:
+        system = platform.system().lower()
+        arch = platform.machine().lower()
+        if system == "darwin":
+            return f"DARWIN_{arch.upper()}"
+        elif system == "linux":
+            return f"LINUX_{arch.upper()}"
+        elif system == "windows":
+            return f"WINDOWS_{arch.upper()}"
+        return "PLATFORM_UNSPECIFIED"
+
+    def _get_client_metadata(self) -> Dict[str, Any]:
+        return {
+            'ideType': 'IDE_UNSPECIFIED',
+            'platform': self._get_platform(),
+            'pluginType': 'GEMINI',
+            'pluginVersion': self._PLUGIN_VERSION,
+        }
+
     def _get_credentials(self) -> Credentials:
         if self.credentials_path.exists():
             try:
-                creds = Credentials.from_authorized_user_file(self.credentials_path, self._OAUTH_SCOPES)
+                creds = Credentials.from_authorized_user_file(str(self.credentials_path), self._OAUTH_SCOPES)
                 if creds and creds.valid: return creds
                 if creds and creds.expired and creds.refresh_token:
                     print("Credentials expired, refreshing...")
@@ -110,32 +131,71 @@ class GeminiClient:
         return creds
 
     def _setup_user(self) -> str:
-        print("Performing user onboarding..."); initial_project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-        client_metadata = {'ideType': 'IDE_UNSPECIFIED', 'platform': 'PLATFORM_UNSPECIFIED', 'pluginType': 'GEMINI', 'duetProject': initial_project_id}
-        load_assist_req = {'cloudaicompanionProject': initial_project_id, 'metadata': client_metadata}
-        # This call now correctly receives a dictionary
-        load_res = self._make_api_request('loadCodeAssist', load_assist_req)
+        print("Performing user onboarding...")
+        initial_project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        client_metadata = self._get_client_metadata()
+        if initial_project_id: client_metadata['duetProject'] = initial_project_id
+        load_assist_req = {'metadata': client_metadata}
+        if initial_project_id: load_assist_req['cloudaicompanionProject'] = initial_project_id
+        
+        max_retries = 5; attempt = 0
+        while attempt < max_retries:
+            try:
+                load_res = self._make_api_request('loadCodeAssist', body=load_assist_req)
+                break # Success
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429 and attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    print(f"Rate limited. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    attempt += 1
+                else:
+                    raise e
+
         default_tier = next((t for t in load_res.get('allowedTiers', []) if t.get('isDefault')), None)
         onboard_tier_id = default_tier['id'] if default_tier else 'legacy-tier'
-        onboard_req = {'tierId': onboard_tier_id, 'cloudaicompanionProject': load_res.get('cloudaicompanionProject') or initial_project_id or '', 'metadata': client_metadata}
-        lro_res = self._make_api_request('onboardUser', onboard_req)
+        onboard_project_id = load_res.get('cloudaicompanionProject') or initial_project_id
+        onboard_req = {'tierId': onboard_tier_id, 'metadata': client_metadata}
+        if onboard_project_id: onboard_req['cloudaicompanionProject'] = onboard_project_id
+        lro_res = self._make_api_request('onboardUser', body=onboard_req)
+        operation_name = lro_res.get('name')
+        if not operation_name:
+            if lro_res.get('done') and 'response' in lro_res:
+                return lro_res.get('response', {}).get('cloudaicompanionProject', {}).get('id', '')
+            raise Exception(f"Failed to start onboarding: {lro_res}")
         while not lro_res.get('done', False):
             print("Onboarding in progress, waiting 5 seconds..."); time.sleep(5)
-            # This call also now correctly receives a dictionary
-            lro_res = self._make_api_request('onboardUser', onboard_req)
-        return lro_res.get('response', {}).get('cloudaicompanionProject', {}).get('id', '')
+            lro_res = self._make_api_request(operation_name, http_method='GET')
+        project_id = lro_res.get('response', {}).get('cloudaicompanionProject', {}).get('id', '')
+        if not project_id: print("Warning: Onboarding complete but no project ID returned.")
+        return project_id
     
-    def _make_api_request(self, method: str, body: dict, stream: bool = False) -> Union[dict, requests.Response]:
-        """
-        Centralized method for making raw API requests.
-        Returns a dictionary for non-streaming requests, and a Response object for streaming requests.
-        """
-        self.credentials.refresh(Request())
-        headers = {'Authorization': f'Bearer {self.credentials.token}', 'Content-Type': 'application/json', 'User-Agent': 'GeminiCLI-Python-Client/1.1'}
-        url = f"{self._CODE_ASSIST_ENDPOINT}/{self._API_VERSION}:{method}"
+    def _make_api_request(self, endpoint: str, body: Dict[str, Any] = None, stream: bool = False, http_method: str = 'POST') -> Union[Dict[str, Any], requests.Response]:
+        """Centralized method for making raw API requests."""
+        if not self.credentials.valid:
+            self.credentials.refresh(Request())
+        
+        client_metadata_str = ",".join([f"{k}={v}" for k, v in self._get_client_metadata().items()])
+        headers = {
+            'Authorization': f'Bearer {self.credentials.token}',
+            'Content-Type': 'application/json',
+            'User-Agent': f'GeminiCLI-Python-Client/{self._PLUGIN_VERSION}',
+            'Client-Metadata': client_metadata_str,
+        }
+
+        if endpoint.startswith('operations/'):
+            url = f"{self._CODE_ASSIST_ENDPOINT}/{endpoint}"
+        else:
+            url = f"{self._CODE_ASSIST_ENDPOINT}/{self._API_VERSION}:{endpoint}"
         params = {'alt': 'sse'} if stream else {}
         
-        response = requests.post(url, headers=headers, json=body, stream=stream, timeout=300, params=params)
+        if http_method.upper() == 'POST':
+            response = requests.post(url, headers=headers, json=body, stream=stream, timeout=300, params=params)
+        elif http_method.upper() == 'GET':
+            response = requests.get(url, headers=headers, stream=stream, timeout=300, params=params)
+        else:
+            raise ValueError(f"Unsupported HTTP method: {http_method}")
+
         response.raise_for_status()
         if not stream:
             return response.json()
@@ -144,10 +204,8 @@ class GeminiClient:
     def count_tokens(self, model: str, contents: list) -> int:
         """Calls the countTokens endpoint."""
         body = {'request': {'model': f'models/{model}', 'contents': contents}}
-        if self.project_id: body['project'] = self.project_id
         try:
-            # This call now correctly receives a dictionary
-            response_json = self._make_api_request('countTokens', body)
+            response_json = self._make_api_request('countTokens', body=body)
             return response_json.get('totalTokens', 0)
         except requests.exceptions.HTTPError as e:
             print(f"\n[Error counting tokens: {e}]")
@@ -164,26 +222,25 @@ class ChatSession:
         if not self.history: return
         token_limit = Token.limit(self.model)
         if self.client.count_tokens(self.model, self.history) > token_limit * 0.9:
-            print("\n[INFO] Context window is getting full. Summarizing conversation to save tokens...")
-            summarization_prompt = "You are a helpful assistant. Summarize our conversation up to this point. The summary should be a concise yet comprehensive overview of all key topics, questions, and answers. This summary will replace the current chat history to conserve tokens, so it must capture everything essential to continue our conversation effectively as if no information was lost."
+            print("\n[INFO] Context window is getting full. Summarizing conversation...")
+            summarization_prompt = "Summarize our conversation concisely. This summary will replace the current history."
             temp_history = self.history + [{'role': 'user', 'parts': [{'text': summarization_prompt}]}]
             body = {'model': self.model, 'request': {'contents': temp_history}}
             if self.client.project_id: body['project'] = self.client.project_id
             try:
-                # This call now correctly receives a dictionary
-                response_json = self.client._make_api_request('generateContent', body)
+                response_json = self.client._make_api_request('generateContent', body=body)
                 summary_text = response_json.get('response', {}).get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
                 if summary_text:
                     self.history = [{'role': 'user', 'parts': [{'text': "Previous conversation summary:"}]}, {'role': 'model', 'parts': [{'text': summary_text}]}]
                     print("[INFO] Conversation summarized successfully.\n")
                 else:
-                    print("[WARN] Failed to summarize conversation, history may be lost on next turn.\n")
+                    print("[WARN] Failed to summarize conversation.\n")
             except (requests.exceptions.HTTPError, KeyError, IndexError) as e:
                 print(f"[ERROR] Could not summarize conversation: {e}\n")
 
     def _handle_flash_fallback(self):
         if self.model == Models.FLASH: return
-        print(f"\n[INFO] ⚡ Persistent rate limiting detected. Automatically switching from {self.model} to {Models.FLASH} for this session to improve responsiveness.")
+        print(f"\n[INFO] \u26a1 Switching from {self.model} to {Models.FLASH} for this session.")
         self.model = Models.FLASH
     
     def send_message(self, prompt: str) -> str:
@@ -195,8 +252,7 @@ class ChatSession:
             body = {'model': self.model, 'request': {'contents': self.history}}
             if self.client.project_id: body['project'] = self.client.project_id
             try:
-                # This call correctly receives a raw Response object because stream=True
-                response = self.client._make_api_request('streamGenerateContent', body, stream=True)
+                response = self.client._make_api_request('streamGenerateContent', body=body, stream=True)
                 return self._process_stream(response)
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 429:
@@ -206,7 +262,7 @@ class ChatSession:
                         rate_limit_errors = 0; continue
                     else:
                         wait_time = 2 ** rate_limit_errors
-                        print(f"\n[WARN] Rate limit exceeded. Retrying in {wait_time} seconds... ({rate_limit_errors}/{max_retries})")
+                        print(f"\n[WARN] Rate limit exceeded. Retrying in {wait_time}s... ({rate_limit_errors}/{max_retries})")
                         time.sleep(wait_time)
                 else:
                     print(f"\n\nHTTP Error: {e.response.status_code}\nResponse Body: {e.response.text}")
@@ -226,8 +282,10 @@ class ChatSession:
                     if text_part:
                         print(text_part, end='', flush=True)
                         full_response_text += text_part
-                except (json.JSONDecodeError, KeyError, IndexError): pass
-                finally: buffer = ""
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    pass # Ignore malformed data chunks
+                finally:
+                    buffer = ""
             elif line_str.startswith('data: '):
                 buffer += line_str[6:]
         print()
@@ -258,12 +316,16 @@ def main():
                 print("\n--- Gemini ---")
                 chat_session.send_message(args.prompt)
             while True:
-                user_input = input("\n> ")
-                if user_input.lower() in ["quit", "exit"]:
-                    print("Ending chat session. Goodbye!")
+                try:
+                    user_input = input("\n> ")
+                    if user_input.lower() in ["quit", "exit"]:
+                        print("Ending chat session. Goodbye!")
+                        break
+                    print("\n--- Gemini ---")
+                    chat_session.send_message(user_input)
+                except (KeyboardInterrupt):
+                    print("\n\nEnding chat session. Goodbye!")
                     break
-                print("\n--- Gemini ---")
-                chat_session.send_message(user_input)
     except (KeyboardInterrupt):
         print("\n\nExiting application.")
     except Exception as e:
