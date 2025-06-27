@@ -1,8 +1,8 @@
 #
 # File: utils/next_speaker_checker.py
-# Revision: 3
-# Description: Reverted to a robust JSON-based schema checking approach
-# to eliminate parsing errors and reliably determine the next speaker.
+# Revision: 4
+# Description: Updates the call to _make_api_request to use `request_components`
+# instead of a pre-built `body`, enabling the retry-safe model fallback logic.
 #
 
 import logging
@@ -69,15 +69,17 @@ async def check_next_speaker(session: 'ChatSession') -> NextSpeaker:
             }
         }
         
-        final_payload = {
-            "model": session.model,
+        request_components = {
             "project": session.client.project_id,
             "request": request_body
         }
         
         # Make the API call
         response_json = await session.client._make_api_request(
-            'generateContent', body=final_payload, stream=False, chat_session=session
+            'generateContent', 
+            request_components=request_components,
+            stream=False, 
+            chat_session=session
         )
         
         # Extract the JSON arguments from the tool call in the response

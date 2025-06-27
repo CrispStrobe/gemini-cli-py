@@ -1,8 +1,8 @@
 #
 # File: main.py
-# Revision: 24
-# Description: Implements conditional debug logging via a --debug flag
-# and a /debug REPL command, using the new centralized logging_config module.
+# Revision: 25
+# Description: Implements REPL commands `/quit` to exit and `/m <model>`
+# to switch models mid-session (e.g., `/m pro` or `/m flash`).
 #
 
 import argparse
@@ -13,7 +13,7 @@ import logging
 from gemini_client import GeminiClient, Models, ChatSession
 from config import load_final_config, validate_auth
 from tools.tool_io import ToolConfirmationOutcome
-from logging_config import configure_logging, toggle_debug_mode # <-- Import new logging utils
+from logging_config import configure_logging, toggle_debug_mode
 
 def prompt_for_confirmation(confirmation_details: dict) -> ToolConfirmationOutcome:
     """Prompts the user to confirm a tool action."""
@@ -119,15 +119,41 @@ async def main():
         while True:
             try:
                 user_input = input("> ")
-                if user_input.lower() in ["quit", "exit"]: break
-                if user_input.lower() == '/reset':
+                cmd = user_input.lower().strip()
+
+                if cmd in ["quit", "exit", "/quit"]: break
+                
+                if cmd.startswith('/m '):
+                    parts = user_input.strip().split(' ', 1)
+                    if len(parts) > 1:
+                        new_model_arg = parts[1].strip().lower()
+                        target_model = None
+                        if new_model_arg == 'flash':
+                            target_model = Models.FLASH
+                        elif new_model_arg == 'pro':
+                            target_model = Models.DEFAULT
+                        elif new_model_arg in Models.all():
+                            target_model = new_model_arg
+                        
+                        if target_model:
+                            chat_session.model = target_model
+                            print(f"[SYSTEM] Model switched to: {chat_session.model}")
+                        else:
+                            print(f"[ERROR] Invalid model. Available: {', '.join(Models.all())} or shorthands 'pro', 'flash'.")
+                    else:
+                        print("[SYSTEM] Usage: /m <model_name|pro|flash>")
+                    continue
+
+                if cmd == '/reset':
                     chat_session.reset()
                     print("\n--- New conversation started ---")
                     continue
-                if user_input.lower() == '/debug':
+                
+                if cmd == '/debug':
                     is_now_debug = toggle_debug_mode()
                     print(f"[SYSTEM] Debug mode is now {'ON' if is_now_debug else 'OFF'}.")
                     continue
+                
                 if not user_input.strip(): continue
                 
                 print("\n--- Gemini ---")

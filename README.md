@@ -1,27 +1,53 @@
 # Gemini Agentic CLI in Python
 
-This is a simple proof-of-concept how the functionality of google [gemini-cli](https://github.com/google-gemini/gemini-cli) could be done in python.
-The interactive command-line interface (CLI) acts as an agentic AI assistant, powered by Google's Gemini models. It leverages an OAuth2 flow to securely authenticate with Google services and uses a suite of file system tools to understand and interact with your local development environment. The agent is capable of understanding natural language commands, executing shell commands, reading and writing files, and searching through a codebase to answer questions or perform tasks.
+This is a simple proof-of-concept how the functionality of google [gemini-cli](https://github.com/google-gemini/gemini-cli) could be implemented in python.
+The interactive command-line interface (CLI) acts as an agentic AI assistant, powered by Google's Gemini models. It leverages an OAuth2 flow to securely authenticate with Google services and uses a suite of tools to understand and interact with your local development environment. The agent is capable of understanding natural language commands, executing shell commands, reading and writing files, and searching through a codebase to answer questions or perform tasks.
 
 ## Features
 
-  * **Interactive REPL:** A Read-Eval-Print Loop allows for continuous, conversational interaction with the agent.
-  * **Secure Authentication:** Uses a standard OAuth2 flow with a local server to securely authenticate the user, caching credentials for future sessions.
-  * **Agentic Tool Use:** The agent can autonomously decide to use tools to fulfill requests. The full agentic loop is implemented:
-    1.  The model receives a prompt and tool definitions.
-    2.  It can request one or more tool calls in a single turn.
-    3.  The client executes these tools (e.g., running a shell command).
-    4.  The results are sent back to the model for processing.
-    5.  The model formulates a final, natural language response based on the tool output.
-  * **File System Tools:**
-      * `shell`: Executes shell commands within the project's directory.
-      * `list_directory`: Lists files and subdirectories at a given path.
-      * `glob`: Finds files matching a specific glob pattern (e.g., `**/*.py`).
-      * `search_file_content`: Performs a fast, regular expression search within project files using `git grep`.
-      * `read_file`: Reads the entire content of a specific file.
-      * `write_file`: Writes content to a file, creating it if necessary or overwriting it.
-  * **Context-Aware File Filtering:** The agent is aware of your version control setup. It automatically respects rules in `.gitignore` and a custom `.geminiignore` file, ensuring it doesn't interact with unintended files.
-  * **Resilient API Communication:** Includes an exponential backoff and retry mechanism to gracefully handle transient API errors like rate limiting (`429 Too Many Requests`).
+  * **Agentic Architecture**:
+
+      * **Multi-Step Task Execution**: The agent can autonomously perform complex tasks that require multiple tool calls and reasoning steps without needing manual intervention for each step.
+      * **Interactive REPL & Non-Interactive Mode**: Use it in a continuous, conversational REPL shell or pass a prompt directly from the command line for single-shot execution.
+      * **Session Persistence**: Automatically saves your conversation state, allowing you to resume your session later. Includes a `/reset` command to start fresh.
+
+  * **Comprehensive Tool Suite**: The agent is equipped with a set of tools to interact with your environment:
+
+      * **Code Navigation**: `list_directory`, `glob`, and `search_file_content` (using `git grep`) to understand your codebase.
+      * **File Operations**: `read_file`, `write_file`, and `replace_in_file` for targeted code edits.
+      * **System Execution**: A `shell` tool to run commands, linters, or tests.
+      * **Knowledge & Memory**: Built-in `Google Search` for up-to-date information and a `save_memory` tool to retain facts across sessions in a global `GEMINI.md` file.
+
+  * **Robust Safety Mechanisms**:
+
+      * **User Confirmation**: Prompts for user approval before any potentially destructive action (e.g., executing shell commands, overwriting files, or making edits).
+      * **Diff Previews**: Before applying code changes with `replace_in_file`, the agent shows you a git-style diff of the proposed modifications.
+      * **Automatic Project Snapshots**: Before making any changes, the agent uses a hidden, shadow git repository to automatically create a snapshot of your project, giving you a safety net.
+      * **Scoped File Access**: Intelligently ignores files specified in your `.gitignore` and `.geminiignore` files.
+
+  * **Resilience & Intelligence**:
+
+      * **API Error Handling**: Features automatic retries with exponential backoff to gracefully handle transient API or network issues.
+      * **Rate Limit Fallback**: To ensure high availability, the agent will automatically and temporarily switch from `gemini-2.5-pro` to the faster `gemini-2.5-flash` model if it detects persistent rate-limiting.
+
+  * **Flexible Configuration**:
+
+      * Load settings from command-line flags, `.env` files, a workspace `.gemini/settings.json`, and a global `~/.gemini/settings.json`.
+      * Toggle verbose debug logging on the fly with a `--debug` flag or a `/debug` REPL command.
+
+## Available Tools
+
+| Tool                  | Description                                                  | Confirmation?     |
+| --------------------- | ------------------------------------------------------------ | ----------------- |
+| `shell`               | Executes a shell command in the project directory.           | **Yes** |
+| `write_file`          | Writes content to a file, overwriting it if it exists.       | **Yes** |
+| `replace_in_file`     | Replaces a specific string in a file.                        | **Yes (with Diff)** |
+| `save_memory`         | Saves a fact to a global long-term memory file.              | **Yes** |
+| `list_directory`      | Lists files and subdirectories, respecting ignore rules.     | No                |
+| `glob`                | Finds files matching a glob pattern (e.g., `src/**/*.py`).   | No                |
+| `search_file_content` | Searches for a regex pattern in all files using `git grep`.  | No                |
+| `read_file`           | Reads the content of a specified file.                       | No                |
+| `Google Search`       | Performs a web search for current events or information.     | No                |
 
 ## Setup and Installation
 

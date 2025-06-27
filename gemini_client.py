@@ -1,8 +1,9 @@
 #
 # File: gemini_client.py
-# Revision: 24
-# Description: Fixes a TypeError/AttributeError by removing an incorrect 'await' 
-# from the synchronous `response.json()` call in _make_api_request.
+# Revision: 25
+# Description: Refactors _make_api_request to be retry-safe for model fallbacks.
+# It now accepts `request_components` and builds the final payload within the
+# retry loop, ensuring the correct model is used after a 429-triggered fallback.
 #
 
 import os
@@ -14,7 +15,6 @@ import webbrowser
 import http.server
 import socketserver
 import urllib.parse
-# ... (other imports are the same)
 import asyncio
 import logging
 import platform
@@ -35,7 +35,6 @@ from prompts import get_core_system_prompt
 from services.memory_discovery import load_memory
 from utils.next_speaker_checker import check_next_speaker, NextSpeaker
 
-
 class Models:
     """Available Gemini model variants with their identifiers."""
     DEFAULT = "gemini-2.5-pro"  # Default high-capability model
@@ -45,7 +44,6 @@ class Models:
     def all(cls) -> List[str]:
         """Returns a list of all available model identifiers."""
         return [cls.DEFAULT, cls.FLASH]
-
 
 class GeminiClient:
     """
@@ -79,7 +77,7 @@ class GeminiClient:
         Args:
             config: Application configuration object
             credentials_dir: Optional custom directory for storing OAuth credentials.
-                           Defaults to ~/.gemini/
+                             Defaults to ~/.gemini/
         """
         self.config = config
         
@@ -386,17 +384,19 @@ class GeminiClient:
         body: Dict[str, Any] = None,
         stream: bool = False, 
         http_method: str = 'POST',
-        chat_session: 'ChatSession' = None
+        chat_session: 'ChatSession' = None,
+        request_components: Dict[str, Any] = None
     ) -> Union[Dict[str, Any], httpx.Response]:
         """
         Make an authenticated API request to the Code Assist endpoint.
         
         Args:
             endpoint: API endpoint to call
-            body: Request body for POST requests
+            body: Request body for POST requests (legacy, for non-chat calls)
             stream: Whether to return a streaming response
             http_method: HTTP method to use ('POST' or 'GET')
             chat_session: Optional chat session for error handling callbacks
+            request_components: Raw request parts for retry-safe payload building
             
         Returns:
             Union[Dict, httpx.Response]: JSON response dict or raw response for streaming
@@ -430,12 +430,22 @@ class GeminiClient:
             # Set up streaming parameters if needed
             params = {'alt': 'sse'} if stream else {}
             
-            logging.debug(f"Making API call: {http_method.upper()} {url}")
+            final_body = None
+            if request_components and chat_session:
+                # New, preferred way for calls that can be retried with model fallback.
+                # The payload is built here to ensure it uses the *current* model.
+                final_body = request_components.copy()
+                final_body["model"] = chat_session.model
+            elif body:
+                # Old way, for calls that don't need model fallback (e.g., onboarding).
+                final_body = body
+
+            logging.debug(f"Making API call: {http_method.upper()} {url} with model {final_body.get('model', 'N/A')}")
             
             # Build and send request
             if http_method.upper() == 'POST':
                 request = self.http_client.build_request(
-                    "POST", url, headers=headers, json=body, params=params
+                    "POST", url, headers=headers, json=final_body, params=params
                 )
             elif http_method.upper() == 'GET':
                 request = self.http_client.build_request(
@@ -503,10 +513,6 @@ class ChatSession:
     def _initialize_chat_context(self):
         """
         Initialize the chat session with system prompt and context.
-        
-        CRITICAL CHANGE: The system prompt is now integrated directly into the
-        chat history as the first user message, followed by a model acknowledgment.
-        This mirrors the TypeScript implementation's approach.
         """
         logging.debug("Initializing chat context...")
         
@@ -522,8 +528,7 @@ class ChatSession:
             full_prompt_text += "You MUST use the following context to augment your knowledge and follow any directives given.\n"
             full_prompt_text += memory_content
 
-        # --- CRITICAL CHANGE ---
-        # Instead of using a system instruction, we add the system prompt as the first
+        # We add the system prompt as the first
         # user message in the history, followed by a model acknowledgment.
         # This ensures proper turn order and compatibility with the API.
         self.history = [

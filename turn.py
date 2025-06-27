@@ -1,9 +1,8 @@
 #
 # File: turn.py
-# Revision: 16
-# Description: Implements a proper asynchronous wait for user confirmations
-# using asyncio.Event, fixing the race condition where the turn would end
-# before a confirmed tool could execute.
+# Revision: 17
+# Description: Updates the call to _make_api_request to use `request_components`
+# instead of a pre-built `body`, enabling the retry-safe model fallback logic.
 #
 
 import json
@@ -38,11 +37,15 @@ class Turn:
             if tools:
                 request_body['tools'] = tools
 
-            final_payload = {"model": self._session.model, "project": self._session.client.project_id, "request": request_body}
+            # This payload is now built inside the retry-safe _make_api_request
+            request_components = {"project": self._session.client.project_id, "request": request_body}
 
             try:
                 response_stream = await self._session.client._make_api_request(
-                    'streamGenerateContent', body=final_payload, stream=True, chat_session=self._session
+                    'streamGenerateContent', 
+                    request_components=request_components,
+                    stream=True, 
+                    chat_session=self._session
                 )
                 function_calls, model_response_text = [], ""
                 async for line in response_stream.aiter_lines():
