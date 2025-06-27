@@ -1,6 +1,6 @@
 #
 # File: gemini_client.py
-# Revision: 14 (Fixes SyntaxError in LRO check)
+# Revision: 17
 # Description: The definitive client for authentication, API communication, and tool-enabled chat sessions.
 #
 
@@ -17,7 +17,7 @@ import asyncio
 import logging
 import platform
 from pathlib import Path
-from typing import Union, List, Dict, Any
+from typing import Union, List, Dict, Any, AsyncGenerator
 
 import httpx
 from google.oauth2.credentials import Credentials
@@ -25,18 +25,22 @@ from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 
 from tool_registry import ToolRegistry
-from tool_scheduler import ToolScheduler
+# No longer importing ToolScheduler here
 from config import Config
+from utils.retry import retry_with_backoff
+from utils.errors import to_friendly_error
+from turn import Turn
 
 class Models:
     DEFAULT = "gemini-2.5-pro"
     FLASH = "gemini-2.5-flash"
-    
+
     @classmethod
     def all(cls) -> List[str]:
         return [cls.DEFAULT, cls.FLASH]
 
 class GeminiClient:
+    # ... (All methods in GeminiClient remain unchanged)
     _OAUTH_CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
     _OAUTH_CLIENT_SECRET = "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"
     _OAUTH_SCOPES = ["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]
@@ -55,7 +59,7 @@ class GeminiClient:
             self.credentials_path = credentials_dir / self._CREDENTIALS_FILENAME
 
         self.credentials = self._get_credentials()
-        self.project_id = None 
+        self.project_id = None
         self.http_client = httpx.AsyncClient(timeout=300.0)
 
     async def aclose(self):
@@ -138,7 +142,6 @@ class GeminiClient:
         lro_res = await self._make_api_request('onboardUser', body=onboard_req)
         operation_name = lro_res.get('name')
         if not operation_name:
-            # *** THIS IS THE FIX for the SyntaxError ***
             if lro_res.get('done') and 'response' in lro_res:
                 return lro_res.get('response', {}).get('cloudaicompanionProject', {}).get('id', '')
             raise Exception(f"Failed to start onboarding: {lro_res}")
@@ -148,34 +151,32 @@ class GeminiClient:
         project_id = lro_res.get('response', {}).get('cloudaicompanionProject', {}).get('id', '')
         if not project_id: print("Warning: Onboarding complete but no project ID returned.")
         return project_id
-    
+
     async def _make_api_request(self, endpoint: str, body: Dict[str, Any] = None, stream: bool = False, http_method: str = 'POST') -> Union[Dict[str, Any], httpx.Response]:
-        max_retries = 5; base_delay_seconds = 2
-        for attempt in range(max_retries):
-            try:
-                if not self.credentials.valid: self.credentials.refresh(Request())
-                client_metadata_str = ",".join([f"{k}={v}" for k, v in self._get_client_metadata().items()])
-                headers = {'Authorization': f'Bearer {self.credentials.token}','Content-Type': 'application/json','User-Agent': f'GeminiCLI-Python-Client/{self._PLUGIN_VERSION}','Client-Metadata': client_metadata_str,}
-                if endpoint.startswith('operations/'): url = f"{self._CODE_ASSIST_ENDPOINT}/{endpoint}"
-                else: url = f"{self._CODE_ASSIST_ENDPOINT}/{self._API_VERSION}:{endpoint}"
-                params = {'alt': 'sse'} if stream else {}
-                logging.debug(f"Making API call: {http_method.upper()} {url} (Attempt {attempt + 1})")
-                if http_method.upper() == 'POST':
-                    response = await self.http_client.post(url, headers=headers, json=body, params=params)
-                elif http_method.upper() == 'GET':
-                    response = await self.http_client.get(url, headers=headers, params=params)
-                else:
-                    raise ValueError(f"Unsupported HTTP method: {http_method}")
-                response.raise_for_status()
-                return response if stream else response.json()
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in [429, 500, 502, 503, 504] and attempt < max_retries - 1:
-                    delay = (base_delay_seconds * 2 ** attempt) + (secrets.randbelow(1000) / 1000)
-                    logging.warning(f"API call failed with status {e.response.status_code}. Retrying in {delay:.2f}s...")
-                    await asyncio.sleep(delay)
-                else:
-                    raise e
-        raise Exception("Exhausted all retry attempts.")
+        async def api_call():
+            if not self.credentials.valid: self.credentials.refresh(Request())
+            client_metadata_str = ",".join([f"{k}={v}" for k, v in self._get_client_metadata().items()])
+            headers = {'Authorization': f'Bearer {self.credentials.token}','Content-Type': 'application/json','User-Agent': f'GeminiCLI-Python-Client/{self._PLUGIN_VERSION}','Client-Metadata': client_metadata_str,}
+            if endpoint.startswith('operations/'): url = f"{self._CODE_ASSIST_ENDPOINT}/{endpoint}"
+            else: url = f"{self._CODE_ASSIST_ENDPOINT}/{self._API_VERSION}:{endpoint}"
+            params = {'alt': 'sse'} if stream else {}
+            logging.debug(f"Making API call: {http_method.upper()} {url}")
+            if http_method.upper() == 'POST':
+                request = self.http_client.build_request("POST", url, headers=headers, json=body, params=params)
+            elif http_method.upper() == 'GET':
+                request = self.http_client.build_request("GET", url, headers=headers, params=params)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {http_method}")
+            response = await self.http_client.send(request, stream=stream)
+            response.raise_for_status()
+            return response
+        try:
+            response = await retry_with_backoff(api_call)
+            return response if stream else response.json()
+        except httpx.HTTPStatusError as e:
+            raise to_friendly_error(e) from e
+        except Exception as e:
+            raise e
 
 class ChatSession:
     """Manages a single conversation, including history and tool use."""
@@ -183,9 +184,9 @@ class ChatSession:
         self.client = client
         self.config = config
         self.model = model
-        self.history = []
+        self.history: List[Dict[str, Any]] = []
         self.tool_registry = ToolRegistry(self.config)
-        self.tool_scheduler = ToolScheduler(self.tool_registry)
+        # The scheduler is now created inside the Turn, not here.
         self.system_instruction = self._initialize_chat_history()
 
     def _initialize_chat_history(self) -> Dict:
@@ -200,51 +201,10 @@ class ChatSession:
         logging.info("Chat history initialized.")
         return {"role": "user", "parts": [{"text": system_prompt_text}]}
 
-    async def send_message(self, prompt: str):
-        logging.info(f"Starting new turn with prompt: {prompt[:80]}...")
-        turn_history = self.history + [{"role": "user", "parts": [{"text": prompt}]}]
-        
-        while True:
-            request_body = {
-                'contents': turn_history,
-                'systemInstruction': self.system_instruction,
-                'tools': [{'functionDeclarations': self.tool_registry.get_declarations()}]
-            }
-            final_payload = {"model": self.model,"project": self.client.project_id,"request": request_body}
-
-            try:
-                response = await self.client._make_api_request('streamGenerateContent', body=final_payload, stream=True)
-                function_calls = []; model_response_text = ""
-                async for line in response.aiter_lines():
-                    if line.startswith('data: '):
-                        try:
-                            data = json.loads(line[6:])
-                            part = data.get('response', {}).get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0]
-                            if 'functionCall' in part:
-                                function_calls.append(part['functionCall'])
-                                yield {'type': 'tool_call_request', 'value': part['functionCall']}
-                            elif 'text' in part:
-                                text = part.get('text', '')
-                                model_response_text += text
-                                yield {'type': 'content', 'value': text}
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            logging.warning(f"Could not parse chunk: {line}")
-                
-                if function_calls:
-                    logging.info(f"Model requested {len(function_calls)} tool call(s).")
-                    model_tool_request_parts = [{'functionCall': fc} for fc in function_calls]
-                    turn_history.append({"role": "model", "parts": model_tool_request_parts})
-                    tool_results = await asyncio.gather(*(self.tool_scheduler.dispatch_tool_call(fc) for fc in function_calls))
-                    turn_history.append({"role": "user", "parts": tool_results})
-                    for result in tool_results:
-                         yield {'type': 'tool_call_response', 'value': result}
-                    continue
-                else:
-                    self.history = turn_history
-                    self.history.append({"role": "model", "parts": [{"text": model_response_text}]})
-                    logging.info("Turn finished with a text response.")
-                    break
-            except httpx.HTTPStatusError as e:
-                logging.error(f"HTTP Error during turn: {e.response.status_code}\nBody: {e.response.text}", exc_info=True)
-                yield {'type': 'error', 'value': f"API Error: {e.response.status_code}"}
-                break
+    async def send_message(self, prompt: str) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Creates and runs a new conversational turn, yielding events as they happen.
+        """
+        turn = Turn(session=self, prompt=prompt)
+        async for event in turn.run():
+            yield event

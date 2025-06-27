@@ -1,7 +1,8 @@
 #
 # File: tools/find_tools.py
-# Revision: 2 (Upgrades GrepTool to use git grep)
-# Description: Contains tools for discovering files and searching content.
+# Revision: 3
+# Description: Implements the required `should_confirm_execute` method
+# for all tool classes in this file.
 #
 
 import asyncio
@@ -15,7 +16,6 @@ from config import Config
 from services.file_discovery_service import FileDiscoveryService
 
 class ListDirectoryTool(Tool):
-    # ... (This class is unchanged)
     def __init__(self, config: Config):
         self._file_service = config.get_file_service()
         self._root_dir = config.get_target_dir()
@@ -26,11 +26,16 @@ class ListDirectoryTool(Tool):
     @property
     def schema(self) -> dict:
         return {"name": self.name,"description": self.description,"parameters": {"type": "OBJECT","properties": {"path": {"type": "STRING","description": "The path to the directory to list."}},"required": ["path"]}}
+
+    async def should_confirm_execute(self, **kwargs) -> dict | None:
+        """This tool is considered safe and does not require confirmation."""
+        return None
+
     async def execute(self, path: str) -> dict:
         try:
             target_path = (self._root_dir / path).resolve()
             if not target_path.is_relative_to(self._root_dir):
-                 return {"error": f"Path must be within project root"}
+                return {"error": f"Path must be within project root"}
             if not target_path.is_dir():
                 return {"error": f"Path is not a directory: {path}"}
             all_entries = list(target_path.iterdir())
@@ -43,7 +48,6 @@ class ListDirectoryTool(Tool):
             return {"error": str(e)}
 
 class GlobTool(Tool):
-    # ... (This class is unchanged)
     def __init__(self, config: Config):
         self._file_service = config.get_file_service()
         self._root_dir = config.get_target_dir()
@@ -54,6 +58,11 @@ class GlobTool(Tool):
     @property
     def schema(self) -> dict:
         return {"name": self.name,"description": self.description,"parameters": {"type": "OBJECT","properties": {"pattern": {"type": "STRING","description": "e.g., 'src/**/*.py'"}},"required": ["pattern"]}}
+
+    async def should_confirm_execute(self, **kwargs) -> dict | None:
+        """This tool is considered safe and does not require confirmation."""
+        return None
+
     async def execute(self, pattern: str) -> dict:
         try:
             all_files = list(self._root_dir.rglob(pattern))
@@ -98,17 +107,17 @@ class GrepTool(Tool):
             },
         }
 
+    async def should_confirm_execute(self, **kwargs) -> dict | None:
+        """This tool is considered safe and does not require confirmation."""
+        return None
+
     async def execute(self, pattern: str) -> dict:
         """Executes the `git grep` search."""
         logging.info(f"Executing git grep for '{pattern}' in '{self._root_dir}'")
-        
+
         try:
-            # Command to run: git grep -n -E --untracked <pattern>
-            # -n: show line numbers
-            # -E: use extended regular expressions
-            # --untracked: search in untracked files as well
             command = ['git', 'grep', '-n', '-E', '--untracked', '--', pattern]
-            
+
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
@@ -116,10 +125,8 @@ class GrepTool(Tool):
                 cwd=self._root_dir
             )
             stdout, stderr = await process.communicate()
-            
+
             if process.returncode != 0 and process.returncode != 1:
-                # returncode 1 means no matches were found, which is not an error.
-                # Other non-zero codes indicate a real error.
                 err_message = stderr.decode('utf-8', 'ignore').strip()
                 logging.error(f"`git grep` failed with code {process.returncode}: {err_message}")
                 return {"error": f"git grep command failed: {err_message}"}
@@ -127,11 +134,10 @@ class GrepTool(Tool):
             output = stdout.decode('utf-8', 'ignore').strip()
             if not output:
                 return {"matches": []}
-            
+
             matches = []
             for line in output.splitlines():
                 try:
-                    # git grep output is typically "file:line:content"
                     parts = line.split(':', 2)
                     if len(parts) == 3:
                         matches.append({

@@ -1,0 +1,56 @@
+#
+# File: tools/base.py
+# Revision: 3
+# Description: Defines the abstract base class for all tools. The
+# ToolConfirmationOutcome enum has been moved to tool_io.py.
+#
+
+import abc
+
+class Tool(abc.ABC):
+    """
+    An abstract base class that defines the interface for all tools.
+    """
+
+    @property
+    @abc.abstractmethod
+    def name(self) -> str:
+        """The unique name of the tool."""
+        pass
+
+    @property
+    @abc.abstractmethod
+    def description(self) -> str:
+        """A detailed description of what the tool does."""
+        pass
+
+    @property
+    @abc.abstractmethod
+    def schema(self) -> dict:
+        """
+        The JSON schema definition for the tool's parameters, matching the
+        FunctionDeclaration format required by the Gemini API.
+        """
+        pass
+
+    @abc.abstractmethod
+    async def execute(self, **kwargs) -> dict:
+        """
+        Executes the tool with the given arguments.
+        """
+        pass
+
+    @abc.abstractmethod
+    async def should_confirm_execute(self, **kwargs) -> dict | None:
+        """
+        Determines if the tool should prompt for confirmation.
+
+        Returns:
+            A dictionary with confirmation details if confirmation is needed,
+            otherwise None.
+        """
+        pass
+
+    def to_dict(self):
+        """Returns the FunctionDeclaration dictionary for the tool."""
+        return self.schema
