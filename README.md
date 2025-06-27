@@ -1,7 +1,7 @@
+
 # Gemini Agentic CLI in Python
 
 This is a simple proof-of-concept how the functionality of google [gemini-cli](https://github.com/google-gemini/gemini-cli) could be done in python.
-
 The interactive command-line interface (CLI) acts as an agentic AI assistant, powered by Google's Gemini models. It leverages an OAuth2 flow to securely authenticate with Google services and uses a suite of file system tools to understand and interact with your local development environment. The agent is capable of understanding natural language commands, executing shell commands, reading and writing files, and searching through a codebase to answer questions or perform tasks.
 
 ## Features

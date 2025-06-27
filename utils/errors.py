@@ -1,10 +1,12 @@
 #
 # File: utils/errors.py
-# Revision: 1
-# Description: Custom exceptions and error handling utilities.
+# Revision: 2
+# Description: Converts the error handler to be async to correctly read
+# the body of failed streaming HTTP responses.
 #
 
 import httpx
+import json
 
 class ForbiddenError(Exception):
     """Raised for 403 Forbidden errors."""
@@ -25,19 +27,24 @@ def get_error_message(error: Exception) -> str:
     except Exception:
         return "Failed to get error details."
 
-def to_friendly_error(error: Exception) -> Exception:
+async def to_friendly_error(error: Exception) -> Exception:
     """
     Converts an httpx.HTTPStatusError into a more specific custom exception
-    based on the HTTP status code.
+    based on the HTTP status code. Now handles streaming responses.
     """
     if isinstance(error, httpx.HTTPStatusError):
         status_code = error.response.status_code
+        message = ""
         try:
-            # Try to parse the JSON body for a more specific message
+            # For streaming responses, we must read the body before accessing it.
+            await error.response.aread()
             data = error.response.json()
             message = data.get("error", {}).get("message", error.response.text)
-        except Exception:
+        except (httpx.ResponseNotRead, json.JSONDecodeError):
+            # Fallback to plain text if it's not JSON or already read
             message = error.response.text
+        except Exception as e:
+            message = f"Failed to parse error response body: {e}"
 
         if status_code == 400:
             return BadRequestError(f"Bad Request (400): {message}")
@@ -46,5 +53,4 @@ def to_friendly_error(error: Exception) -> Exception:
         if status_code == 403:
             return ForbiddenError(f"Forbidden (403): {message}")
 
-    # Return the original error if it's not a handled HTTPStatusError
     return error
