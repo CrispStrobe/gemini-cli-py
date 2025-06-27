@@ -1,8 +1,8 @@
 #
 # File: main.py
-# Revision: 23
-# Description: Final, stable version with all bug fixes, including the --reset
-# command-line argument.
+# Revision: 24
+# Description: Implements conditional debug logging via a --debug flag
+# and a /debug REPL command, using the new centralized logging_config module.
 #
 
 import argparse
@@ -10,21 +10,13 @@ import asyncio
 import traceback
 import logging
 
-# Centralized imports
 from gemini_client import GeminiClient, Models, ChatSession
-from config import load_final_config, validate_auth, Config
+from config import load_final_config, validate_auth
 from tools.tool_io import ToolConfirmationOutcome
-from utils.next_speaker_checker import NextSpeaker
-from turn import Turn
-from tool_registry import ToolRegistry
-from typing import List, Dict, Any, AsyncGenerator
-
-
-# Setup logging
-logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] [%(levelname)s] [%(filename)s:%(lineno)d] %(message)s')
+from logging_config import configure_logging, toggle_debug_mode # <-- Import new logging utils
 
 def prompt_for_confirmation(confirmation_details: dict) -> ToolConfirmationOutcome:
-    # ... (function is unchanged)
+    """Prompts the user to confirm a tool action."""
     details_type = confirmation_details.get("type")
     prompt_str = ""
     if details_type == "edit":
@@ -39,34 +31,31 @@ def prompt_for_confirmation(confirmation_details: dict) -> ToolConfirmationOutco
         prompt_str += f"Write/overwrite file: `{confirmation_details['path']}`?\n"
     else:
         prompt_str += f"Proceed with tool call: {confirmation_details}?\n"
-    if details_type == 'exec': prompt_str += "  (y)es, (n)o, (a)lways"
-    else: prompt_str += "  (y)es, (n)o"
+    
+    if details_type == 'exec': 
+        prompt_str += "  (y)es, (n)o, (a)lways"
+    else: 
+        prompt_str += "  (y)es, (n)o"
+        
     while True:
-        response = input(f"\n[CONFIRMATION] {prompt_str}\n").lower().strip()
+        response = input(f"\n[CONFIRMATION] {prompt_str}\n> ").lower().strip()
         if response in ['y', 'yes']: return ToolConfirmationOutcome.PROCEED_ONCE
         if response in ['n', 'no']: return ToolConfirmationOutcome.CANCEL
         if response in ['a', 'always'] and details_type == 'exec': return ToolConfirmationOutcome.PROCEED_ALWAYS
-        elif response in ['a', 'always']:
-             print("The 'always' option is only available for shell commands. Please choose 'y' or 'n'.")
-             continue
         print("Invalid input. Please enter a valid option.")
 
-# Patch ChatSession to add the reset method
-def _chat_session_reset(self):
-    logging.info("Resetting chat session history.")
-    self._initialize_chat_context()
-ChatSession.reset = _chat_session_reset
-
 async def main():
-    parser = argparse.ArgumentParser(description="A command-line interface for Google Gemini using OAuth.")
-    parser.add_argument("prompt", nargs='?', default=None, help="The initial prompt to send to the model before starting the interactive session.")
+    parser = argparse.ArgumentParser(description="A command-line interface for Google Gemini.")
+    parser.add_argument("prompt", nargs='?', default=None, help="The initial prompt.")
     parser.add_argument("-m", "--model", default=Models.DEFAULT, choices=Models.all(), help="The model to use.")
-    # This ensures the --reset flag is recognized
-    parser.add_argument("--reset", action="store_true", help="Start a new session and ignore any saved checkpoint.")
+    parser.add_argument("--reset", action="store_true", help="Start a new session, ignoring any saved checkpoint.")
+    parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging.")
     args = parser.parse_args()
 
+    # Configure logging based on the --debug flag
+    configure_logging(args.debug)
+
     client: GeminiClient | None = None
-    chat_session: ChatSession | None = None
     try:
         logging.info("Loading configuration...")
         config = load_final_config()
@@ -79,6 +68,7 @@ async def main():
         logging.info("Initializing Gemini OAuth Client...")
         client = GeminiClient(config)
         await client.initialize_user()
+        
         chat_session = client.start_chat(config, args.model)
         
         if not args.reset:
@@ -90,47 +80,40 @@ async def main():
             print("--- Started new session (--reset flag used) ---")
 
         logging.info("Client initialized successfully!")
-        print(f"\n--- Starting Interactive Chat (Model: {chat_session.model}) ---") # Use session model
-        print("Type '/reset' to start a new conversation, or 'quit'/'exit' to end the session.")
+        print(f"\n--- Starting Interactive Chat (Model: {chat_session.model}) ---")
+        print("Type '/reset' to start a new conversation, '/debug' to toggle debug logs, or 'quit'/'exit' to end.")
 
-        # ... (handle_send_message and run_turn functions are unchanged)
-        async def handle_send_message(prompt: str):
-            # Pass the chat session to the API request context
-            turn_generator = chat_session.send_message(prompt)
-            citations = None
+        async def handle_send_message(prompt: str, turn_session: ChatSession):
+            turn_generator = turn_session.send_message(prompt)
             async for event in turn_generator:
-                if event['type'] == 'content': print(event['value'], end='', flush=True)
-                elif event['type'] == 'citations': citations = event['value']
+                if event['type'] == 'content':
+                    print(event['value'], end='', flush=True)
                 elif event['type'] == 'tool_call_response':
-                    result_name = event['value']['functionResponse']['name']
-                    result_content = event['value']['functionResponse']['response'].get('content', {})
-                    if 'error' in result_content: print(f"\n[AGENT] Error from {result_name}: {result_content['error']}")
-                    else: print(f"\n[AGENT] Tool {result_name} executed.")
-                elif event['type'] == 'error': print(f"\n[ERROR] An error occurred: {event['value']}")
+                    response_data = event['value']['functionResponse']['response']
+                    tool_name = event['value']['functionResponse']['name']
+                    if 'error' in response_data:
+                        print(f"\n[AGENT] Error from {tool_name}: {response_data['error']}")
+                    else:
+                        print(f"\n[AGENT] Tool {tool_name} executed.")
+                elif event['type'] == 'error':
+                    print(f"\n[ERROR] An error occurred: {event['value']}")
                 elif event['type'] == 'confirmation_request':
-                    print()
+                    print() # Newline for clarity
                     outcome = prompt_for_confirmation(event['value']['confirmation_details'])
-                    if chat_session.current_turn: 
-                        chat_session.current_turn.provide_confirmation_response(event['value'], outcome)
-                        # Continue the turn after providing confirmation response
-                        continue
-            if citations:
-                print("\n\n--- Sources ---")
-                for i, ref in enumerate(citations['references']): print(f"[{i+1}] {ref.get('title', 'N/A')}: {ref.get('uri', 'N/A')}")
-        
-        async def run_turn(prompt: str):
-            # Pass the chat session to API requests made within the turn
-            await handle_send_message(prompt)
-            next_speaker = await chat_session.check_next_speaker()
+                    turn_session.current_turn.provide_confirmation_response(event['value'], outcome)
+
+        async def run_turn(prompt: str, turn_session: ChatSession):
+            await handle_send_message(prompt, turn_session)
+            next_speaker = await turn_session.check_next_speaker()
             if next_speaker == "model":
-                print(f"\n[AGENT] Continuing task (using model: {chat_session.model})...")
-                await run_turn("Continue.")
+                print(f"\n[AGENT] Continuing task (using model: {turn_session.model})...")
+                await run_turn("Continue.", turn_session)
         
         if args.prompt:
             print(f"\n> {args.prompt}")
             print("\n--- Gemini ---")
-            await run_turn(args.prompt)
-            if chat_session and config: config.get_logger().save_checkpoint(chat_session.history)
+            await run_turn(args.prompt, chat_session)
+            logger.save_checkpoint(chat_session.history)
             print("\n----------------\n")
 
         while True:
@@ -141,22 +124,27 @@ async def main():
                     chat_session.reset()
                     print("\n--- New conversation started ---")
                     continue
+                if user_input.lower() == '/debug':
+                    is_now_debug = toggle_debug_mode()
+                    print(f"[SYSTEM] Debug mode is now {'ON' if is_now_debug else 'OFF'}.")
+                    continue
                 if not user_input.strip(): continue
+                
                 print("\n--- Gemini ---")
-                await run_turn(user_input)
-                if chat_session and config: config.get_logger().save_checkpoint(chat_session.history)
+                await run_turn(user_input, chat_session)
+                logger.save_checkpoint(chat_session.history)
                 print("\n----------------\n")
             except KeyboardInterrupt:
                 print("\nUse 'quit' or 'exit' to end the session.")
                 continue
-    except KeyboardInterrupt:
-        print("\n\nExiting application. Goodbye!")
+            
     except Exception as e:
-        print(f"\nAn unexpected error occurred: {e}")
+        logging.error(f"An unexpected error occurred: {e}")
         traceback.print_exc()
     finally:
         if client:
             await client.aclose()
+        print("\nExiting application. Goodbye!")
 
 if __name__ == '__main__':
     asyncio.run(main())

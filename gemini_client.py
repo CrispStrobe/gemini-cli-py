@@ -508,7 +508,7 @@ class ChatSession:
         chat history as the first user message, followed by a model acknowledgment.
         This mirrors the TypeScript implementation's approach.
         """
-        logging.info("Initializing chat context...")
+        logging.debug("Initializing chat context...")
         
         # Get target directory and build system prompt
         target_dir = self.config.get_target_dir()
@@ -537,7 +537,7 @@ class ChatSession:
             }
         ]
         
-        logging.info("Chat context initialized successfully.")
+        logging.debug("Chat context initialized successfully.")
 
     async def send_message(self, prompt: str) -> AsyncGenerator[Dict[str, Any], None]:
         """
@@ -568,7 +568,7 @@ class ChatSession:
         last_message = self.history[-1]
         if (last_message.get("role") == "user" and 
             any("functionResponse" in part for part in last_message.get("parts", []))):
-            logging.info("Last message was a tool response, model must be the next speaker.")
+            logging.debug("Last message was a tool response, model must be the next speaker.")
             return "model"
         
         # Use external logic for other cases
@@ -602,8 +602,8 @@ class ChatSession:
               f"Temporarily switching from {self.model} to {Models.FLASH} "
               f"to complete the request.")
         
-        logging.info(f"Switching model from {self.model} to {Models.FLASH} due to persistent 429 errors.")
+        logging.warning(f"Switching model from {self.model} to {Models.FLASH} due to persistent 429 errors.")
         self.model = Models.FLASH
-        logging.info(f"Model successfully switched to {self.model}.")
+        logging.info(f"Model switched to {self.model}.")
         
         return True
