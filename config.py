@@ -1,8 +1,9 @@
 #
 # File: config.py
-# Revision: 7
-# Description: Provides access to all shared services including the
-# GitService and Logger.
+# Revision: 9
+# Description: CRITICAL FIX. Reverts the DEFAULT_MODEL constant from the
+# incorrect "1.5" version back to the correct "2.5-pro" version.
+# This fixes the bug causing the application to start with the wrong model.
 #
 
 import argparse
@@ -15,7 +16,6 @@ from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
 
-# These imports assume the files exist from previous steps
 from services.file_discovery_service import FileDiscoveryService
 from services.git_service import GitService
 from logger import Logger
@@ -24,6 +24,7 @@ from logger import Logger
 SETTINGS_DIRECTORY_NAME = '.gemini'
 USER_SETTINGS_DIR = Path.home() / SETTINGS_DIRECTORY_NAME
 USER_SETTINGS_PATH = USER_SETTINGS_DIR / 'settings.json'
+# FIX: Reverted to the correct default model.
 DEFAULT_MODEL = "gemini-2.5-pro"
 
 class AuthType:
@@ -120,22 +121,19 @@ def load_and_merge_settings(workspace_dir: Path) -> Dict:
     return merged
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Gemini CLI Python Replica")
-    parser.add_argument("-m", "--model", type=str, help="Model to use.")
-    auth_choices = [getattr(AuthType, attr) for attr in dir(AuthType) if not attr.startswith('__')]
-    parser.add_argument("--auth_type", type=str, choices=auth_choices, help="Authentication type.")
-    return parser.parse_args()
+    # This function is now only used by load_final_config. The main parser is in main.py.
+    return argparse.Namespace()
 
-def load_final_config() -> Config:
-    args = parse_arguments()
+def load_final_config(cli_args: argparse.Namespace = None) -> Config:
+    args = cli_args if cli_args is not None else parse_arguments()
     env_file_path = find_env_file(Path.cwd())
     if env_file_path:
         load_dotenv(dotenv_path=env_file_path, override=True)
         logging.info(f"Loaded environment variables from: {env_file_path}")
     settings = load_and_merge_settings(Path.cwd())
     raw_config_dict = {
-        "model": (args.model or os.getenv("GEMINI_MODEL") or settings.get("model") or DEFAULT_MODEL),
-        "auth_type": (args.auth_type or os.getenv("GEMINI_AUTH_TYPE") or settings.get("selectedAuthType") or AuthType.LOGIN_WITH_GOOGLE_PERSONAL),
+        "model": (args.model if hasattr(args, 'model') and args.model else os.getenv("GEMINI_MODEL") or settings.get("model") or DEFAULT_MODEL),
+        "auth_type": (os.getenv("GEMINI_AUTH_TYPE") or settings.get("selectedAuthType") or AuthType.LOGIN_WITH_GOOGLE_PERSONAL),
         "GOOGLE_CLOUD_PROJECT": (os.getenv("GOOGLE_CLOUD_PROJECT") or settings.get("GOOGLE_CLOUD_PROJECT")),
     }
     return Config(raw_config_dict)

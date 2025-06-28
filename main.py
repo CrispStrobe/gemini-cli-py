@@ -1,9 +1,11 @@
 #
 # File: main.py
-# Revision: 30
-# Description: Fixes the NameError by importing Config. Refactors the main
-# loop to use the new self-contained ChatSession class from chat_session.py.
-# The REPL is now a clean UI controller, delegating all conversation logic.
+# Revision: 31
+# Description: Implements snapshot safety feature and fixes UI bugs.
+# - Integrates the now-functional GitService to automatically create a project
+#   snapshot before every agentic turn.
+# - Fixes the toolbar styling by replacing raw ANSI strings with a proper
+#   `prompt_toolkit.styles.Style` object, removing the `<b>` tags.
 #
 
 import argparse
@@ -18,25 +20,28 @@ import re
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.formatted_text import to_formatted_text
+from prompt_toolkit.styles import Style
 
-# Fix: Import the Config class
 from config import Config, load_final_config, validate_auth, USER_SETTINGS_DIR
 from gemini_client import GeminiClient, Models
-from chat_session import ChatSession # <-- Import the new ChatSession class
+from chat_session import ChatSession
 from tools.tool_io import ToolConfirmationOutcome
 from logging_config import configure_logging
 from at_command_processor import handle_at_command
 from slash_command_processor import SlashCommandProcessor
 
 class AppState(Enum):
-    """Defines the possible states of the REPL application."""
     IDLE = auto()
     PROCESSING = auto()
     WAITING_FOR_CONFIRMATION = auto()
 
+# FIX: Define a style for the toolbar instead of using raw tags
+ui_style = Style.from_dict({
+    'toolbar': 'bg:#444444 #ffffff bold',
+})
+
 def prompt_for_confirmation(confirmation_details: dict) -> ToolConfirmationOutcome:
-    """Prompts the user to confirm a tool action."""
     details_type = confirmation_details.get("type")
     prompt_str = ""
     if details_type == "edit":
@@ -58,19 +63,19 @@ def prompt_for_confirmation(confirmation_details: dict) -> ToolConfirmationOutco
         prompt_str += "  (y)es, (n)o"
 
     while True:
-        # Use standard input for confirmation prompts, as the main prompt is now async
         response = input(f"\n[CONFIRMATION] {prompt_str}\n> ").lower().strip()
         if response in ['y', 'yes']: return ToolConfirmationOutcome.PROCEED_ONCE
         if response in ['n', 'no']: return ToolConfirmationOutcome.CANCEL
         if response in ['a', 'always'] and details_type == 'exec': return ToolConfirmationOutcome.PROCEED_ALWAYS
         print("Invalid input. Please enter a valid option.")
 
-
 class AgenticREPL:
     """Manages the application state and main REPL loop."""
     def __init__(self, config: Config, initial_model: str, reset_session: bool):
         self.config = config
         self.logger = config.get_logger()
+        # Initialize the GitService as a core component of the REPL
+        self.git_service = config.get_git_service()
         self.is_running = True
         self.state = AppState.IDLE
         self.client: GeminiClient | None = None
@@ -81,7 +86,7 @@ class AgenticREPL:
         self.start_time = 0
 
     def _get_toolbar_text(self):
-        """Generates the text for the bottom toolbar based on the current state."""
+        """Generates the styled text for the bottom toolbar."""
         elapsed = f"{(time.time() - self.start_time):.1f}s" if self.start_time else ""
         model_name = self.chat_session.model if self.chat_session else ""
         
@@ -94,13 +99,13 @@ class AgenticREPL:
         else:
             text = "[UNKNOWN STATE]"
             
-        return ANSI(f" <b>{text}</b>")
+        # FIX: Use `to_formatted_text` for proper styling without raw tags
+        return to_formatted_text(text, style='class:toolbar')
 
     async def _initialize(self):
         """Initializes client and creates the chat session."""
         self.client = GeminiClient(self.config)
         await self.client.initialize_user()
-        # The REPL now creates the ChatSession directly
         self.chat_session = ChatSession(self.client, self.config, self.initial_model)
         
         if not self.reset_session:
@@ -112,10 +117,15 @@ class AgenticREPL:
             print("--- Started new session (--reset flag used) ---")
 
     async def _run_turn(self, prompt):
-        """Processes a single turn of the conversation, handling all events."""
+        """Processes a single turn of the conversation."""
         self.state = AppState.PROCESSING
         self.start_time = time.time()
         try:
+            # Create a snapshot before the turn begins
+            snapshot_hash = self.git_service.create_file_snapshot(f"Snapshot before prompt: {prompt if isinstance(prompt, str) else prompt[0]['text'][:50]}...")
+            if snapshot_hash:
+                logging.info(f"Created pre-turn snapshot: {snapshot_hash}")
+
             turn_generator = self.chat_session.send_message_stream(prompt)
             async for event in turn_generator:
                 if event['type'] == 'content':
@@ -126,9 +136,6 @@ class AgenticREPL:
                     outcome = await asyncio.to_thread(prompt_for_confirmation, event['value']['confirmation_details'])
                     self.state = AppState.PROCESSING
                     self.chat_session.provide_confirmation_response(event['value'], outcome)
-                elif event['type'] == 'tool_call_response':
-                    # This is now just for display, the logic is in ChatSession
-                    pass
                 elif event['type'] == 'error':
                      print(f"\n[ERROR] An error occurred: {event['value']}")
 
@@ -151,7 +158,8 @@ class AgenticREPL:
         session = PromptSession(
             history=FileHistory(str(history_path)),
             bottom_toolbar=self._get_toolbar_text,
-            refresh_interval=0.5
+            refresh_interval=0.5,
+            style=ui_style # Apply the style object to the session
         )
         
         print(f"\n--- Starting Interactive Chat (Model: {self.chat_session.model}) ---")
@@ -183,7 +191,7 @@ class AgenticREPL:
 async def main():
     parser = argparse.ArgumentParser(description="A command-line interface for Google Gemini.")
     parser.add_argument("prompt", nargs='?', default=None, help="The initial prompt.")
-    parser.add_argument("-m", "--model", default=Models.DEFAULT, choices=Models.all(), help="The model to use.")
+    parser.add_argument("-m", "--model", choices=Models.all(), help="The model to use.")
     parser.add_argument("--reset", action="store_true", help="Start a new session, ignoring any saved checkpoint.")
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging.")
     args = parser.parse_args()
@@ -192,16 +200,15 @@ async def main():
     
     repl_app: AgenticREPL | None = None
     try:
-        config = load_final_config()
+        config = load_final_config(args)
         error_message = validate_auth(config)
         if error_message: raise ValueError(error_message)
         
-        # Non-interactive mode needs to be re-implemented with the new ChatSession structure
         if args.prompt:
-            print("[INFO] Non-interactive mode is a future enhancement and will be implemented after the REPL is complete.")
+            print("[INFO] Non-interactive mode is a future enhancement.")
             return
 
-        repl_app = AgenticREPL(config, args.model, args.reset)
+        repl_app = AgenticREPL(config, config.get_model(), args.reset)
         await repl_app.run()
         
     except Exception as e:
