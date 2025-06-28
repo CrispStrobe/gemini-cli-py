@@ -1,20 +1,29 @@
 #
 # File: main.py
-# Revision: 25
-# Description: Implements REPL commands `/quit` to exit and `/m <model>`
-# to switch models mid-session (e.g., `/m pro` or `/m flash`).
+# Revision: 27
+# Description:
+# Integrates the new at_command_processor. Before sending a prompt to the
+# Turn, it's now pre-processed to handle @-file commands.
 #
 
 import argparse
 import asyncio
 import traceback
 import logging
+from pathlib import Path
+import re # Import re for at_command_processor integration
+
+# Import prompt_toolkit components
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
 
 from gemini_client import GeminiClient, Models, ChatSession
-from config import load_final_config, validate_auth
+from config import load_final_config, validate_auth, USER_SETTINGS_DIR
 from tools.tool_io import ToolConfirmationOutcome
 from logging_config import configure_logging, toggle_debug_mode
+from at_command_processor import handle_at_command # <-- Import the new processor
 
+# ... (prompt_for_confirmation function remains the same) ...
 def prompt_for_confirmation(confirmation_details: dict) -> ToolConfirmationOutcome:
     """Prompts the user to confirm a tool action."""
     details_type = confirmation_details.get("type")
@@ -31,13 +40,14 @@ def prompt_for_confirmation(confirmation_details: dict) -> ToolConfirmationOutco
         prompt_str += f"Write/overwrite file: `{confirmation_details['path']}`?\n"
     else:
         prompt_str += f"Proceed with tool call: {confirmation_details}?\n"
-    
-    if details_type == 'exec': 
+
+    if details_type == 'exec':
         prompt_str += "  (y)es, (n)o, (a)lways"
-    else: 
+    else:
         prompt_str += "  (y)es, (n)o"
-        
+
     while True:
+        # Use standard input for confirmation prompts, as the main prompt is now async
         response = input(f"\n[CONFIRMATION] {prompt_str}\n> ").lower().strip()
         if response in ['y', 'yes']: return ToolConfirmationOutcome.PROCEED_ONCE
         if response in ['n', 'no']: return ToolConfirmationOutcome.CANCEL
@@ -68,9 +78,9 @@ async def main():
         logging.info("Initializing Gemini OAuth Client...")
         client = GeminiClient(config)
         await client.initialize_user()
-        
+
         chat_session = client.start_chat(config, args.model)
-        
+
         if not args.reset:
             saved_history = logger.load_checkpoint()
             if saved_history:
@@ -80,10 +90,8 @@ async def main():
             print("--- Started new session (--reset flag used) ---")
 
         logging.info("Client initialized successfully!")
-        print(f"\n--- Starting Interactive Chat (Model: {chat_session.model}) ---")
-        print("Type '/reset' to start a new conversation, '/debug' to toggle debug logs, or 'quit'/'exit' to end.")
 
-        async def handle_send_message(prompt: str, turn_session: ChatSession):
+        async def handle_send_message(prompt, turn_session: ChatSession): # prompt type updated implicitly
             turn_generator = turn_session.send_message(prompt)
             async for event in turn_generator:
                 if event['type'] == 'content':
@@ -99,30 +107,44 @@ async def main():
                     print(f"\n[ERROR] An error occurred: {event['value']}")
                 elif event['type'] == 'confirmation_request':
                     print() # Newline for clarity
-                    outcome = prompt_for_confirmation(event['value']['confirmation_details'])
+                    # Run blocking input in a separate thread to not block asyncio event loop
+                    outcome = await asyncio.to_thread(prompt_for_confirmation, event['value']['confirmation_details'])
                     turn_session.current_turn.provide_confirmation_response(event['value'], outcome)
 
-        async def run_turn(prompt: str, turn_session: ChatSession):
+        async def run_turn(prompt, turn_session: ChatSession): # prompt type updated implicitly
             await handle_send_message(prompt, turn_session)
             next_speaker = await turn_session.check_next_speaker()
             if next_speaker == "model":
                 print(f"\n[AGENT] Continuing task (using model: {turn_session.model})...")
+                # When continuing, the prompt is a simple instruction, not a user input
                 await run_turn("Continue.", turn_session)
-        
+
+        # Handle non-interactive mode
         if args.prompt:
             print(f"\n> {args.prompt}")
             print("\n--- Gemini ---")
-            await run_turn(args.prompt, chat_session)
+            processed_prompt = await handle_at_command(args.prompt, config, chat_session.tool_registry)
+            await run_turn(processed_prompt, chat_session)
             logger.save_checkpoint(chat_session.history)
             print("\n----------------\n")
+            return # Exit after non-interactive run
 
+        # Setup for interactive REPL mode
+        print(f"\n--- Starting Interactive Chat (Model: {chat_session.model}) ---")
+        print("Type '/reset' to start a new conversation, '/debug' to toggle debug logs, or 'quit'/'exit' to end.")
+        
+        history_path = USER_SETTINGS_DIR / "prompt_history.txt"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        session = PromptSession(history=FileHistory(str(history_path)))
+
+        # Main REPL loop using prompt_toolkit
         while True:
             try:
-                user_input = input("> ")
+                user_input = await session.prompt_async("> ")
                 cmd = user_input.lower().strip()
 
                 if cmd in ["quit", "exit", "/quit"]: break
-                
+
                 if cmd.startswith('/m '):
                     parts = user_input.strip().split(' ', 1)
                     if len(parts) > 1:
@@ -134,7 +156,7 @@ async def main():
                             target_model = Models.DEFAULT
                         elif new_model_arg in Models.all():
                             target_model = new_model_arg
-                        
+
                         if target_model:
                             chat_session.model = target_model
                             print(f"[SYSTEM] Model switched to: {chat_session.model}")
@@ -148,22 +170,25 @@ async def main():
                     chat_session.reset()
                     print("\n--- New conversation started ---")
                     continue
-                
+
                 if cmd == '/debug':
                     is_now_debug = toggle_debug_mode()
                     print(f"[SYSTEM] Debug mode is now {'ON' if is_now_debug else 'OFF'}.")
                     continue
-                
+
                 if not user_input.strip(): continue
-                
+
                 print("\n--- Gemini ---")
-                await run_turn(user_input, chat_session)
+                # Pre-process the prompt for @-commands before sending
+                processed_prompt = await handle_at_command(user_input, config, chat_session.tool_registry)
+                await run_turn(processed_prompt, chat_session)
                 logger.save_checkpoint(chat_session.history)
                 print("\n----------------\n")
-            except KeyboardInterrupt:
-                print("\nUse 'quit' or 'exit' to end the session.")
-                continue
-            
+
+            except (KeyboardInterrupt, EOFError):
+                # Handle Ctrl+C gracefully in the prompt, Ctrl+D to exit
+                break
+
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
         traceback.print_exc()
@@ -173,4 +198,8 @@ async def main():
         print("\nExiting application. Goodbye!")
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, EOFError):
+        # Prevent traceback on graceful exit
+        print("\nExiting.")

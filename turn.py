@@ -1,14 +1,15 @@
 #
 # File: turn.py
-# Revision: 17
-# Description: Updates the call to _make_api_request to use `request_components`
-# instead of a pre-built `body`, enabling the retry-safe model fallback logic.
+# Revision: 18
+# Description: 
+# The Turn class is updated to accept a structured prompt (a list of parts)
+# from the at_command_processor, in addition to a simple string.
 #
 
 import json
 import logging
 import asyncio
-from typing import AsyncGenerator, Dict, Any, List, Literal, TYPE_CHECKING
+from typing import AsyncGenerator, Dict, Any, List, Literal, TYPE_CHECKING, Union
 
 from core_tool_scheduler import CoreToolScheduler
 from tools.tool_io import ToolConfirmationOutcome
@@ -16,8 +17,10 @@ from tools.tool_io import ToolConfirmationOutcome
 if TYPE_CHECKING:
     from gemini_client import ChatSession
 
+PromptType = Union[str, List[Dict[str, str]]]
+
 class Turn:
-    def __init__(self, session: 'ChatSession', prompt: str):
+    def __init__(self, session: 'ChatSession', prompt: PromptType):
         self._session = session
         self._prompt = prompt
         self._turn_history: List[Dict[str, Any]] = []
@@ -28,8 +31,15 @@ class Turn:
         self._confirmation_outcome: ToolConfirmationOutcome | None = None
 
     async def run(self) -> AsyncGenerator[Dict[str, Any], None]:
-        logging.info(f"Starting new turn with prompt: {self._prompt[:80]}...")
-        self._turn_history = self._session.history + [{"role": "user", "parts": [{"text": self._prompt}]}]
+        prompt_str_for_log = str(self._prompt)[:80]
+        logging.info(f"Starting new turn with prompt: {prompt_str_for_log}...")
+        
+        if isinstance(self._prompt, str):
+            user_parts = [{"text": self._prompt}]
+        else: # It's a list of parts
+            user_parts = self._prompt
+
+        self._turn_history = self._session.history + [{"role": "user", "parts": user_parts}]
 
         while True:
             tools = self._session.tool_registry.get_declarations()
@@ -42,9 +52,9 @@ class Turn:
 
             try:
                 response_stream = await self._session.client._make_api_request(
-                    'streamGenerateContent', 
+                    'streamGenerateContent',
                     request_components=request_components,
-                    stream=True, 
+                    stream=True,
                     chat_session=self._session
                 )
                 function_calls, model_response_text = [], ""

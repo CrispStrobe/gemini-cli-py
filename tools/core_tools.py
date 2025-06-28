@@ -1,20 +1,31 @@
 #
 # File: tools/core_tools.py
-# Revision: 6
-# Description: Updates imports to use the new tool_io.py file.
+# Revision: 7
+# Description: 
+# The ShellTool is significantly enhanced to be more robust and secure.
+# - Uses `create_subprocess_exec` instead of `shell=True` for better security.
+# - Streams stdout/stderr to detect binary content and prevent terminal corruption.
+# - Returns a detailed dictionary of the execution result.
 #
+
 import asyncio
 import logging
 from pathlib import Path
+import shlex
 
 from .base import Tool
-from .tool_io import ToolConfirmationOutcome # <-- Import from new location
+from .tool_io import ToolConfirmationOutcome
 from config import Config
-from services.file_discovery_service import FileDiscoveryService
+
+def is_binary(data: bytes, sample_size=1024) -> bool:
+    """Checks if a Buffer is likely binary by testing for NULL bytes."""
+    if not data:
+        return False
+    sample = data[:sample_size]
+    return b'\x00' in sample
 
 class ShellTool(Tool):
-    # ... (No changes to the class implementation itself)
-    """A tool for executing shell commands."""
+    """A tool for executing shell commands in a controlled manner."""
     def __init__(self, config: Config):
         self._config = config
         self._whitelist = set()
@@ -29,7 +40,10 @@ class ShellTool(Tool):
 
     def _get_command_root(self, command: str) -> str | None:
         """Extracts the base command for whitelisting (e.g., 'ls' from 'ls -l')."""
-        return command.strip().split(" ")[0]
+        try:
+            return shlex.split(command.strip())[0]
+        except (ValueError, IndexError):
+            return None
 
     async def should_confirm_execute(self, command: str) -> dict | None:
         """Checks if the shell command needs user confirmation."""
@@ -54,16 +68,71 @@ class ShellTool(Tool):
     async def execute(self, command: str) -> dict:
         logging.info(f"Executing shell command: {command}")
         try:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self._config.get_target_dir()
+            # Use shlex to safely split the command for create_subprocess_exec
+            if platform.system() == "Windows":
+                 # On Windows, shell=True is often more reliable for complex commands.
+                 # We accept the reduced security for better cross-platform compatibility here.
+                 proc = await asyncio.create_subprocess_shell(
+                     command,
+                     stdout=asyncio.subprocess.PIPE,
+                     stderr=asyncio.subprocess.PIPE,
+                     cwd=self._config.get_target_dir()
+                 )
+            else:
+                 # On Unix-like systems, use shlex.split for better security.
+                 cmd_parts = shlex.split(command)
+                 proc = await asyncio.create_subprocess_exec(
+                     *cmd_parts,
+                     stdout=asyncio.subprocess.PIPE,
+                     stderr=asyncio.subprocess.PIPE,
+                     cwd=self._config.get_target_dir()
+                 )
+
+            stdout_chunks = []
+            stderr_chunks = []
+
+            # Stream output to detect binary content
+            binary_detected = False
+            async def read_stream(stream, chunk_list):
+                nonlocal binary_detected
+                while True:
+                    chunk = await stream.read(1024)
+                    if not chunk:
+                        break
+                    if not binary_detected:
+                        if is_binary(chunk):
+                            binary_detected = True
+                        chunk_list.append(chunk)
+
+            await asyncio.gather(
+                read_stream(proc.stdout, stdout_chunks),
+                read_stream(proc.stderr, stderr_chunks)
             )
-            stdout, stderr = await process.communicate()
-            return {"stdout": stdout.decode('utf-8', 'ignore'),"stderr": stderr.decode('utf-8', 'ignore'),"returncode": process.returncode}
+
+            await proc.wait()
+
+            stdout_bytes = b"".join(stdout_chunks)
+            stderr_bytes = b"".join(stderr_chunks)
+
+            if binary_detected:
+                return {
+                    "stdout": f"[Binary output detected ({len(stdout_bytes)} bytes)]",
+                    "stderr": f"[Binary output detected in stderr ({len(stderr_bytes)} bytes)]",
+                    "returncode": proc.returncode,
+                    "error": None
+                }
+            else:
+                 return {
+                    "stdout": stdout_bytes.decode('utf-8', 'ignore'),
+                    "stderr": stderr_bytes.decode('utf-8', 'ignore'),
+                    "returncode": proc.returncode,
+                    "error": None
+                }
+
+        except FileNotFoundError as e:
+            return {"error": f"Command not found: {e.filename}", "returncode": 127}
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": str(e), "returncode": 1}
 
 
 class ReadFileTool(Tool):
