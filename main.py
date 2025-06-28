@@ -1,9 +1,9 @@
 #
 # File: main.py
-# Revision: 27
-# Description:
-# Integrates the new at_command_processor. Before sending a prompt to the
-# Turn, it's now pre-processed to handle @-file commands.
+# Revision: 30
+# Description: Fixes the NameError by importing Config. Refactors the main
+# loop to use the new self-contained ChatSession class from chat_session.py.
+# The REPL is now a clean UI controller, delegating all conversation logic.
 #
 
 import argparse
@@ -11,19 +11,30 @@ import asyncio
 import traceback
 import logging
 from pathlib import Path
-import re # Import re for at_command_processor integration
+from enum import Enum, auto
+import time
+import re
 
-# Import prompt_toolkit components
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.formatted_text import ANSI
 
-from gemini_client import GeminiClient, Models, ChatSession
-from config import load_final_config, validate_auth, USER_SETTINGS_DIR
+# Fix: Import the Config class
+from config import Config, load_final_config, validate_auth, USER_SETTINGS_DIR
+from gemini_client import GeminiClient, Models
+from chat_session import ChatSession # <-- Import the new ChatSession class
 from tools.tool_io import ToolConfirmationOutcome
-from logging_config import configure_logging, toggle_debug_mode
-from at_command_processor import handle_at_command # <-- Import the new processor
+from logging_config import configure_logging
+from at_command_processor import handle_at_command
+from slash_command_processor import SlashCommandProcessor
 
-# ... (prompt_for_confirmation function remains the same) ...
+class AppState(Enum):
+    """Defines the possible states of the REPL application."""
+    IDLE = auto()
+    PROCESSING = auto()
+    WAITING_FOR_CONFIRMATION = auto()
+
 def prompt_for_confirmation(confirmation_details: dict) -> ToolConfirmationOutcome:
     """Prompts the user to confirm a tool action."""
     details_type = confirmation_details.get("type")
@@ -54,6 +65,121 @@ def prompt_for_confirmation(confirmation_details: dict) -> ToolConfirmationOutco
         if response in ['a', 'always'] and details_type == 'exec': return ToolConfirmationOutcome.PROCEED_ALWAYS
         print("Invalid input. Please enter a valid option.")
 
+
+class AgenticREPL:
+    """Manages the application state and main REPL loop."""
+    def __init__(self, config: Config, initial_model: str, reset_session: bool):
+        self.config = config
+        self.logger = config.get_logger()
+        self.is_running = True
+        self.state = AppState.IDLE
+        self.client: GeminiClient | None = None
+        self.chat_session: ChatSession | None = None
+        self.initial_model = initial_model
+        self.reset_session = reset_session
+        self.processing_task: asyncio.Task | None = None
+        self.start_time = 0
+
+    def _get_toolbar_text(self):
+        """Generates the text for the bottom toolbar based on the current state."""
+        elapsed = f"{(time.time() - self.start_time):.1f}s" if self.start_time else ""
+        model_name = self.chat_session.model if self.chat_session else ""
+        
+        if self.state == AppState.IDLE:
+            text = f"[IDLE] Model: {model_name}"
+        elif self.state == AppState.PROCESSING:
+            text = f"[PROCESSING... {elapsed}] Model: {model_name}"
+        elif self.state == AppState.WAITING_FOR_CONFIRMATION:
+            text = f"[WAITING FOR CONFIRMATION] Model: {model_name}"
+        else:
+            text = "[UNKNOWN STATE]"
+            
+        return ANSI(f" <b>{text}</b>")
+
+    async def _initialize(self):
+        """Initializes client and creates the chat session."""
+        self.client = GeminiClient(self.config)
+        await self.client.initialize_user()
+        # The REPL now creates the ChatSession directly
+        self.chat_session = ChatSession(self.client, self.config, self.initial_model)
+        
+        if not self.reset_session:
+            saved_history = self.logger.load_checkpoint()
+            if saved_history:
+                self.chat_session.history = saved_history
+                print("--- Resumed session from checkpoint ---")
+        else:
+            print("--- Started new session (--reset flag used) ---")
+
+    async def _run_turn(self, prompt):
+        """Processes a single turn of the conversation, handling all events."""
+        self.state = AppState.PROCESSING
+        self.start_time = time.time()
+        try:
+            turn_generator = self.chat_session.send_message_stream(prompt)
+            async for event in turn_generator:
+                if event['type'] == 'content':
+                    print(event['value'], end='', flush=True)
+                elif event['type'] == 'confirmation_request':
+                    self.state = AppState.WAITING_FOR_CONFIRMATION
+                    print()
+                    outcome = await asyncio.to_thread(prompt_for_confirmation, event['value']['confirmation_details'])
+                    self.state = AppState.PROCESSING
+                    self.chat_session.provide_confirmation_response(event['value'], outcome)
+                elif event['type'] == 'tool_call_response':
+                    # This is now just for display, the logic is in ChatSession
+                    pass
+                elif event['type'] == 'error':
+                     print(f"\n[ERROR] An error occurred: {event['value']}")
+
+            next_speaker = await self.chat_session.check_next_speaker()
+            if next_speaker == "model":
+                print(f"\n[AGENT] Continuing task (using model: {self.chat_session.model})...")
+                await self._run_turn("Continue.")
+
+        finally:
+            self.state = AppState.IDLE
+            self.start_time = 0
+
+    async def run(self):
+        """Runs the main REPL loop."""
+        await self._initialize()
+        command_processor = SlashCommandProcessor(self, self.chat_session)
+        
+        history_path = USER_SETTINGS_DIR / "prompt_history.txt"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        session = PromptSession(
+            history=FileHistory(str(history_path)),
+            bottom_toolbar=self._get_toolbar_text,
+            refresh_interval=0.5
+        )
+        
+        print(f"\n--- Starting Interactive Chat (Model: {self.chat_session.model}) ---")
+        print("Type /help for a list of commands.")
+
+        while self.is_running:
+            try:
+                with patch_stdout():
+                    user_input = await session.prompt_async("> ")
+                
+                if await command_processor.process(user_input):
+                    continue
+
+                if not user_input.strip(): continue
+
+                print("\n--- Gemini ---")
+                processed_prompt = await handle_at_command(user_input, self.config, self.chat_session.tool_registry)
+                
+                self.processing_task = asyncio.create_task(self._run_turn(processed_prompt))
+                await self.processing_task
+                
+                self.logger.save_checkpoint(self.chat_session.history)
+                print("\n----------------\n")
+                
+            except (KeyboardInterrupt, EOFError):
+                self.is_running = False
+                break
+
 async def main():
     parser = argparse.ArgumentParser(description="A command-line interface for Google Gemini.")
     parser.add_argument("prompt", nargs='?', default=None, help="The initial prompt.")
@@ -62,144 +188,32 @@ async def main():
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging.")
     args = parser.parse_args()
 
-    # Configure logging based on the --debug flag
     configure_logging(args.debug)
-
-    client: GeminiClient | None = None
+    
+    repl_app: AgenticREPL | None = None
     try:
-        logging.info("Loading configuration...")
         config = load_final_config()
-        logger = config.get_logger()
-        config.get_git_service()
-
         error_message = validate_auth(config)
         if error_message: raise ValueError(error_message)
-
-        logging.info("Initializing Gemini OAuth Client...")
-        client = GeminiClient(config)
-        await client.initialize_user()
-
-        chat_session = client.start_chat(config, args.model)
-
-        if not args.reset:
-            saved_history = logger.load_checkpoint()
-            if saved_history:
-                chat_session.history = saved_history
-                print("--- Resumed session from checkpoint ---")
-        else:
-            print("--- Started new session (--reset flag used) ---")
-
-        logging.info("Client initialized successfully!")
-
-        async def handle_send_message(prompt, turn_session: ChatSession): # prompt type updated implicitly
-            turn_generator = turn_session.send_message(prompt)
-            async for event in turn_generator:
-                if event['type'] == 'content':
-                    print(event['value'], end='', flush=True)
-                elif event['type'] == 'tool_call_response':
-                    response_data = event['value']['functionResponse']['response']
-                    tool_name = event['value']['functionResponse']['name']
-                    if 'error' in response_data:
-                        print(f"\n[AGENT] Error from {tool_name}: {response_data['error']}")
-                    else:
-                        print(f"\n[AGENT] Tool {tool_name} executed.")
-                elif event['type'] == 'error':
-                    print(f"\n[ERROR] An error occurred: {event['value']}")
-                elif event['type'] == 'confirmation_request':
-                    print() # Newline for clarity
-                    # Run blocking input in a separate thread to not block asyncio event loop
-                    outcome = await asyncio.to_thread(prompt_for_confirmation, event['value']['confirmation_details'])
-                    turn_session.current_turn.provide_confirmation_response(event['value'], outcome)
-
-        async def run_turn(prompt, turn_session: ChatSession): # prompt type updated implicitly
-            await handle_send_message(prompt, turn_session)
-            next_speaker = await turn_session.check_next_speaker()
-            if next_speaker == "model":
-                print(f"\n[AGENT] Continuing task (using model: {turn_session.model})...")
-                # When continuing, the prompt is a simple instruction, not a user input
-                await run_turn("Continue.", turn_session)
-
-        # Handle non-interactive mode
-        if args.prompt:
-            print(f"\n> {args.prompt}")
-            print("\n--- Gemini ---")
-            processed_prompt = await handle_at_command(args.prompt, config, chat_session.tool_registry)
-            await run_turn(processed_prompt, chat_session)
-            logger.save_checkpoint(chat_session.history)
-            print("\n----------------\n")
-            return # Exit after non-interactive run
-
-        # Setup for interactive REPL mode
-        print(f"\n--- Starting Interactive Chat (Model: {chat_session.model}) ---")
-        print("Type '/reset' to start a new conversation, '/debug' to toggle debug logs, or 'quit'/'exit' to end.")
         
-        history_path = USER_SETTINGS_DIR / "prompt_history.txt"
-        history_path.parent.mkdir(parents=True, exist_ok=True)
-        session = PromptSession(history=FileHistory(str(history_path)))
+        # Non-interactive mode needs to be re-implemented with the new ChatSession structure
+        if args.prompt:
+            print("[INFO] Non-interactive mode is a future enhancement and will be implemented after the REPL is complete.")
+            return
 
-        # Main REPL loop using prompt_toolkit
-        while True:
-            try:
-                user_input = await session.prompt_async("> ")
-                cmd = user_input.lower().strip()
-
-                if cmd in ["quit", "exit", "/quit"]: break
-
-                if cmd.startswith('/m '):
-                    parts = user_input.strip().split(' ', 1)
-                    if len(parts) > 1:
-                        new_model_arg = parts[1].strip().lower()
-                        target_model = None
-                        if new_model_arg == 'flash':
-                            target_model = Models.FLASH
-                        elif new_model_arg == 'pro':
-                            target_model = Models.DEFAULT
-                        elif new_model_arg in Models.all():
-                            target_model = new_model_arg
-
-                        if target_model:
-                            chat_session.model = target_model
-                            print(f"[SYSTEM] Model switched to: {chat_session.model}")
-                        else:
-                            print(f"[ERROR] Invalid model. Available: {', '.join(Models.all())} or shorthands 'pro', 'flash'.")
-                    else:
-                        print("[SYSTEM] Usage: /m <model_name|pro|flash>")
-                    continue
-
-                if cmd == '/reset':
-                    chat_session.reset()
-                    print("\n--- New conversation started ---")
-                    continue
-
-                if cmd == '/debug':
-                    is_now_debug = toggle_debug_mode()
-                    print(f"[SYSTEM] Debug mode is now {'ON' if is_now_debug else 'OFF'}.")
-                    continue
-
-                if not user_input.strip(): continue
-
-                print("\n--- Gemini ---")
-                # Pre-process the prompt for @-commands before sending
-                processed_prompt = await handle_at_command(user_input, config, chat_session.tool_registry)
-                await run_turn(processed_prompt, chat_session)
-                logger.save_checkpoint(chat_session.history)
-                print("\n----------------\n")
-
-            except (KeyboardInterrupt, EOFError):
-                # Handle Ctrl+C gracefully in the prompt, Ctrl+D to exit
-                break
-
+        repl_app = AgenticREPL(config, args.model, args.reset)
+        await repl_app.run()
+        
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
         traceback.print_exc()
     finally:
-        if client:
-            await client.aclose()
+        if repl_app and repl_app.client:
+            await repl_app.client.aclose()
         print("\nExiting application. Goodbye!")
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, EOFError):
-        # Prevent traceback on graceful exit
         print("\nExiting.")
