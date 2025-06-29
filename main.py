@@ -1,11 +1,10 @@
 #
 # File: main.py
-# Revision: 31
-# Description: Implements snapshot safety feature and fixes UI bugs.
-# - Integrates the now-functional GitService to automatically create a project
-#   snapshot before every agentic turn.
-# - Fixes the toolbar styling by replacing raw ANSI strings with a proper
-#   `prompt_toolkit.styles.Style` object, removing the `<b>` tags.
+# Revision: 34
+# Description: CRITICAL FIX. Adds backward compatibility for loading old
+# checkpoint files. The previous version would crash if it found a checkpoint
+# saved in the old list-based format. This version now checks the format
+# and handles both old ([...]) and new ({'history':...}) structures.
 #
 
 import argparse
@@ -20,7 +19,7 @@ import re
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.formatted_text import to_formatted_text
+from prompt_toolkit.formatted_text import to_formatted_text, FormattedText
 from prompt_toolkit.styles import Style
 
 from config import Config, load_final_config, validate_auth, USER_SETTINGS_DIR
@@ -36,9 +35,10 @@ class AppState(Enum):
     PROCESSING = auto()
     WAITING_FOR_CONFIRMATION = auto()
 
-# FIX: Define a style for the toolbar instead of using raw tags
 ui_style = Style.from_dict({
     'toolbar': 'bg:#444444 #ffffff bold',
+    'prompt.branch': 'bg:#444444 #d85f00',
+    'prompt.gt': 'bg:#444444 #ffffff bold',
 })
 
 def prompt_for_confirmation(confirmation_details: dict) -> ToolConfirmationOutcome:
@@ -70,11 +70,9 @@ def prompt_for_confirmation(confirmation_details: dict) -> ToolConfirmationOutco
         print("Invalid input. Please enter a valid option.")
 
 class AgenticREPL:
-    """Manages the application state and main REPL loop."""
     def __init__(self, config: Config, initial_model: str, reset_session: bool):
         self.config = config
         self.logger = config.get_logger()
-        # Initialize the GitService as a core component of the REPL
         self.git_service = config.get_git_service()
         self.is_running = True
         self.state = AppState.IDLE
@@ -84,9 +82,9 @@ class AgenticREPL:
         self.reset_session = reset_session
         self.processing_task: asyncio.Task | None = None
         self.start_time = 0
+        self.current_branch: str | None = None
 
     def _get_toolbar_text(self):
-        """Generates the styled text for the bottom toolbar."""
         elapsed = f"{(time.time() - self.start_time):.1f}s" if self.start_time else ""
         model_name = self.chat_session.model if self.chat_session else ""
         
@@ -99,33 +97,46 @@ class AgenticREPL:
         else:
             text = "[UNKNOWN STATE]"
             
-        # FIX: Use `to_formatted_text` for proper styling without raw tags
         return to_formatted_text(text, style='class:toolbar')
 
+    def _get_prompt_message(self) -> FormattedText:
+        if self.current_branch:
+            return FormattedText([
+                ('class:prompt.branch', f'({self.current_branch})'),
+                ('class:prompt.gt', ' > '),
+            ])
+        return FormattedText([('class:prompt.gt', '> ')])
+
     async def _initialize(self):
-        """Initializes client and creates the chat session."""
         self.client = GeminiClient(self.config)
         await self.client.initialize_user()
         self.chat_session = ChatSession(self.client, self.config, self.initial_model)
+        self.current_branch = self.git_service.get_current_branch_name()
         
         if not self.reset_session:
-            saved_history = self.logger.load_checkpoint()
-            if saved_history:
-                self.chat_session.history = saved_history
+            checkpoint_data = self.logger.load_checkpoint()
+            if checkpoint_data:
+                # FIX: Add backward compatibility for old list-based checkpoints
+                if isinstance(checkpoint_data, dict):
+                    # New format: {'history': [...], 'commit_hash': '...'}
+                    self.chat_session.history = checkpoint_data.get("history", [])
+                elif isinstance(checkpoint_data, list):
+                    # Old format: [...]
+                    logging.warning("Old checkpoint format detected. Loading history only.")
+                    self.chat_session.history = checkpoint_data
                 print("--- Resumed session from checkpoint ---")
         else:
+            # Clear default checkpoint if resetting
+            self.logger.save_checkpoint([], None) 
             print("--- Started new session (--reset flag used) ---")
 
     async def _run_turn(self, prompt):
-        """Processes a single turn of the conversation."""
         self.state = AppState.PROCESSING
         self.start_time = time.time()
         try:
-            # Create a snapshot before the turn begins
-            snapshot_hash = self.git_service.create_file_snapshot(f"Snapshot before prompt: {prompt if isinstance(prompt, str) else prompt[0]['text'][:50]}...")
-            if snapshot_hash:
-                logging.info(f"Created pre-turn snapshot: {snapshot_hash}")
-
+            prompt_for_log = prompt[0]['text'][:50] if isinstance(prompt, list) and prompt else str(prompt)[:50]
+            snapshot_hash = self.git_service.create_file_snapshot(f"Snapshot before prompt: {prompt_for_log}...")
+            
             turn_generator = self.chat_session.send_message_stream(prompt)
             async for event in turn_generator:
                 if event['type'] == 'content':
@@ -147,9 +158,10 @@ class AgenticREPL:
         finally:
             self.state = AppState.IDLE
             self.start_time = 0
+            final_hash = self.git_service.create_file_snapshot("Snapshot after turn completion.")
+            self.logger.save_checkpoint(self.chat_session.history, final_hash)
 
     async def run(self):
-        """Runs the main REPL loop."""
         await self._initialize()
         command_processor = SlashCommandProcessor(self, self.chat_session)
         
@@ -159,7 +171,8 @@ class AgenticREPL:
             history=FileHistory(str(history_path)),
             bottom_toolbar=self._get_toolbar_text,
             refresh_interval=0.5,
-            style=ui_style # Apply the style object to the session
+            style=ui_style,
+            message=self._get_prompt_message
         )
         
         print(f"\n--- Starting Interactive Chat (Model: {self.chat_session.model}) ---")
@@ -168,7 +181,7 @@ class AgenticREPL:
         while self.is_running:
             try:
                 with patch_stdout():
-                    user_input = await session.prompt_async("> ")
+                    user_input = await session.prompt_async()
                 
                 if await command_processor.process(user_input):
                     continue
@@ -181,7 +194,6 @@ class AgenticREPL:
                 self.processing_task = asyncio.create_task(self._run_turn(processed_prompt))
                 await self.processing_task
                 
-                self.logger.save_checkpoint(self.chat_session.history)
                 print("\n----------------\n")
                 
             except (KeyboardInterrupt, EOFError):

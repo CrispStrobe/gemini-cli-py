@@ -2,7 +2,8 @@
 # File: gemini_client.py
 # Revision: 32
 # Description: CRITICAL FIX. Reverts the model names in the Models class
-# from the incorrect "1.5" version back to the correct "2.5" versions.
+# from the incorrect "1.5" version back to the correct "2.5" versions,
+# which are used by the cloudcode-pa.googleapis.com endpoint.
 #
 
 import os
@@ -47,8 +48,6 @@ class GeminiClient:
     """
     Main client for interacting with the Gemini API through Google Cloud's Code Assist endpoint.
     """
-
-    # OAuth 2.0 configuration constants
     _OAUTH_CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
     _OAUTH_CLIENT_SECRET = "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"
     _OAUTH_SCOPES = [
@@ -56,8 +55,6 @@ class GeminiClient:
         "https://www.googleapis.com/auth/userinfo.email",
         "https://www.googleapis.com/auth/userinfo.profile"
     ]
-
-    # File and endpoint configuration
     _CREDENTIALS_FILENAME = "oauth_creds.json"
     _TOKEN_URI = "https://oauth2.googleapis.com/token"
     _AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
@@ -80,7 +77,7 @@ class GeminiClient:
 
     async def initialize_user(self):
         self.project_id = await self._setup_user()
-        print(f"User setup complete. Using Project ID: {self.project_id or 'N/A'}")
+        logging.info(f"User setup complete. Using Project ID: {self.project_id or 'N/A'}")
 
     def start_chat(self, config: Config, model: str) -> 'ChatSession':
         from chat_session import ChatSession
@@ -118,7 +115,7 @@ class GeminiClient:
         self.credentials_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.credentials_path, 'w') as f:
             f.write(creds.to_json())
-        print(f"Credentials saved to {self.credentials_path}")
+        logging.info(f"Credentials saved to {self.credentials_path}")
 
     def _run_oauth_flow(self) -> Credentials:
         print("Gemini login required.")
@@ -187,7 +184,7 @@ class GeminiClient:
             await asyncio.sleep(5)
             lro_res = await self._make_api_request(operation_name, http_method='GET')
         project_id = lro_res.get('response', {}).get('cloudaicompanionProject', {}).get('id', '')
-        if not project_id: print("Warning: Onboarding complete but no project ID returned.")
+        if not project_id: logging.warning("Onboarding complete but no project ID returned.")
         return project_id
 
     async def _make_api_request(self, endpoint: str, body: Dict[str, Any] = None, stream: bool = False, http_method: str = 'POST', chat_session: 'ChatSession' = None, request_components: Dict[str, Any] = None) -> Union[Dict[str, Any], httpx.Response]:
